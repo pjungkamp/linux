@@ -170,3 +170,7 @@ sphinx_*/
 
 # Rust analyzer configuration
 /rust-project.json
+
+# LKP files
+*.img
+*.sh
