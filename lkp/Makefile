@@ -1,3 +1,3 @@
 # SPDX-License-Identifier: GPL-2.0
 
-obj-m += example.o hellosysfs.o helloioctl.o
+obj-m += example.o hellosysfs.o helloioctl.o taskmonitor.o
