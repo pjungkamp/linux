@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include "linux/gfp_types.h"
+#include "linux/list.h"
+#include "linux/shrinker.h"
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/err.h>
@@ -20,7 +23,8 @@ struct taskmonitor {
 	struct mutex lock;
 	struct pid *pid;
 	struct list_head samples;
-	int samples_count;
+	unsigned long samples_count;
+	struct shrinker samples_shrinker;
 
 	struct mutex thread_lock;
 	struct task_struct *thread;
@@ -55,7 +59,6 @@ static struct taskmonitor_sample *taskmonitor_sample_new(struct taskmonitor *tmo
 	if (IS_ERR(ret))
 		goto err_pid_alive;
 
-	INIT_LIST_HEAD(&ret->list);
 	ret->pid = pid_nr(tmon->pid);
 	ret->utime = task->utime;
 	ret->stime = task->stime;
@@ -85,8 +88,10 @@ static void taskmonitor_samples_reset(struct taskmonitor *tmon)
 	struct taskmonitor_sample *smp, *next;
 
 	tmon->samples_count = 0;
-	list_for_each_entry_safe(smp, next, &tmon->samples, list)
+	list_for_each_entry_safe(smp, next, &tmon->samples, list) {
+		list_del(&smp->list);
 		taskmonitor_sample_free(smp);
+	}
 }
 
 static void taskmonitor_unset_pid(struct taskmonitor *tmon)
@@ -98,6 +103,11 @@ static void taskmonitor_unset_pid(struct taskmonitor *tmon)
 	tmon->pid = NULL;
 
 	taskmonitor_samples_reset(tmon);
+}
+
+static bool taskmonitor_trylock(struct taskmonitor *tmon)
+{
+	return mutex_trylock(&tmon->lock);
 }
 
 static void taskmonitor_lock(struct taskmonitor *tmon)
@@ -120,7 +130,7 @@ static int taskmonitor_threadfn(void *arg)
 		taskmonitor_lock(tmon);
 
 		smp = taskmonitor_sample_new(tmon);
-		if (IS_ERR(smp)) {
+		if (IS_ERR_OR_NULL(smp)) {
 			taskmonitor_unset_pid(tmon);
 			taskmonitor_unlock(tmon);
 			return PTR_ERR(smp);
@@ -143,13 +153,12 @@ static int taskmonitor_start_unlocked(struct taskmonitor *tmon)
 	if (tmon->thread)
 		return 0;
 
-	thread = kthread_create(taskmonitor_threadfn, tmon, "taskmonitor(%d)", pid_nr(tmon->pid));
+	thread = kthread_create(taskmonitor_threadfn, tmon, "taskmonitor/pid:%d", pid_nr(tmon->pid));
 	if (IS_ERR(thread))
 		return PTR_ERR(thread);
 
 	get_task_struct(thread);
 	wake_up_process(thread);
-
 	tmon->thread = thread;
 
 	return 0;
@@ -218,8 +227,50 @@ static int taskmonitor_set_pid(struct taskmonitor *tmon, pid_t nr)
 	return 0;
 }
 
+static unsigned long taskmonitor_samples_count_objects(struct shrinker *sh,
+						       struct shrink_control *sc)
+{
+	unsigned long count;
+	struct taskmonitor *tmon = container_of(sh, struct taskmonitor, samples_shrinker);
+
+	taskmonitor_lock(tmon);
+
+	count = tmon->samples_count ? tmon->samples_count : SHRINK_EMPTY;
+
+	taskmonitor_unlock(tmon);
+
+	return count;
+}
+
+static unsigned long taskmonitor_samples_scan_objects(struct shrinker *sh,
+						       struct shrink_control *sc)
+{
+	struct taskmonitor *tmon = container_of(sh, struct taskmonitor, samples_shrinker);
+	struct taskmonitor_sample *smp, *next;
+
+	if (!taskmonitor_trylock(tmon))
+		return SHRINK_STOP;
+
+	sc->nr_scanned = 0;
+	list_for_each_entry_safe(smp, next, &tmon->samples, list) {
+		if (sc->nr_scanned >= sc->nr_to_scan)
+			break;
+
+		list_del(&smp->list);
+		taskmonitor_sample_free(smp);
+
+		tmon->samples_count--;
+		sc->nr_scanned++;
+	}
+
+	taskmonitor_unlock(tmon);
+
+	return sc->nr_scanned;
+}
+
 static struct taskmonitor *taskmonitor_new(void)
 {
+	int err;
 	struct taskmonitor *tmon;
 
 	tmon = kzalloc(sizeof(struct taskmonitor), GFP_KERNEL);
@@ -229,14 +280,28 @@ static struct taskmonitor *taskmonitor_new(void)
 	mutex_init(&tmon->lock);
 	mutex_init(&tmon->thread_lock);
 	INIT_LIST_HEAD(&tmon->samples);
+	tmon->samples_shrinker.count_objects = taskmonitor_samples_count_objects;
+	tmon->samples_shrinker.scan_objects = taskmonitor_samples_scan_objects;
+	tmon->samples_shrinker.batch = 0;
+	tmon->samples_shrinker.seeks = DEFAULT_SEEKS;
+	err = register_shrinker(&tmon->samples_shrinker, "taskmonitor");
+	if (err)
+		goto err_shrinker;
 
 	return tmon;
+
+err_shrinker:
+	mutex_destroy(&tmon->lock);
+	mutex_destroy(&tmon->thread_lock);
+	kfree(tmon);
+	return ERR_PTR(err);
 }
 
 static void taskmonitor_free(struct taskmonitor *tmon)
 {
 	taskmonitor_stop_unlocked(tmon);
 	taskmonitor_unset_pid(tmon);
+	unregister_shrinker(&tmon->samples_shrinker);
 	mutex_destroy(&tmon->lock);
 	mutex_destroy(&tmon->thread_lock);
 	kfree(tmon);
@@ -247,17 +312,22 @@ static struct taskmonitor *taskmonitor_private;
 
 static long taskmonitor_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	int ret;
+	int ret = 0;
 	pid_t pid;
 	void __user *ptr = (void __user *)arg;
 	struct taskmonitor *tmon = taskmonitor_private;
 	struct taskmonitor_sample *smp;
 
+	taskmonitor_lock(tmon);
+
 	switch (cmd) {
 	case TM_GET:
-		smp = taskmonitor_sample_new(tmon);
-		if (IS_ERR_OR_NULL(smp))
-			return smp ? PTR_ERR(smp) : -EINVAL;
+		if (list_empty(&tmon->samples)) {
+			ret = -ENODATA;
+			break;
+		}
+
+		smp = list_first_entry(&tmon->samples, struct taskmonitor_sample, list);
 
 		struct task_sample usmp = {
 			.utime = smp->utime,
@@ -265,34 +335,43 @@ static long taskmonitor_ioctl(struct file *file, unsigned int cmd, unsigned long
 		};
 
 		ret = copy_to_user(ptr, &usmp, sizeof(usmp));
-		taskmonitor_sample_free(smp);
-		return ret;
+		break;
 
 	case TM_START:
-		return taskmonitor_start(tmon);
+		ret = taskmonitor_start(tmon);
+		break;
 
 	case TM_STOP:
 		taskmonitor_stop(tmon);
-		return 0;
+		break;
 
 	case TM_PID:
 		ret = copy_from_user(&pid, ptr, sizeof(pid));
 		if (ret)
-			return ret;
+			break;
 
-		if (pid < 0) {
-			if (!tmon->pid)
-				return -EINVAL;
-
-			pid = pid_nr(tmon->pid);
-			return copy_to_user(ptr, &pid, sizeof(pid));
-		} else {
-			return taskmonitor_set_pid(tmon, pid);
+		if (pid >= 0) {
+			ret = taskmonitor_set_pid(tmon, pid);
+			break;
 		}
 
+		if (!tmon->pid) {
+			ret = -ENODATA;
+			break;
+		}
+
+		pid = pid_nr(tmon->pid);
+		ret = copy_to_user(ptr, &pid, sizeof(pid));
+		break;
+
 	default:
-		return -ENOTTY;
+		ret = -EINVAL;
+		break;
 	}
+
+	taskmonitor_unlock(tmon);
+
+	return ret;
 }
 
 static int taskmonitor_major;
