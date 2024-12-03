@@ -19,6 +19,9 @@
 struct taskmonitor {
 	struct mutex lock;
 	struct pid *pid;
+	struct list_head samples;
+	int samples_count;
+
 	struct mutex thread_lock;
 	struct task_struct *thread;
 };
@@ -27,7 +30,64 @@ struct taskmonitor_sample {
 	pid_t pid;
 	u64 utime;
 	u64 stime;
+	unsigned long vm_total;
+	unsigned long vm_stack;
+	unsigned long vm_data;
+
+	struct list_head list;
 };
+
+static struct taskmonitor_sample *taskmonitor_sample_new(struct taskmonitor *tmon)
+{
+	struct taskmonitor_sample *ret = NULL;
+	struct task_struct *task;
+
+	task = get_pid_task(tmon->pid, PIDTYPE_PID);
+	if (IS_ERR_OR_NULL(task)) {
+		ret = ERR_CAST(task);
+		goto err_pid_task;
+	}
+
+	if (!pid_alive(task))
+		goto err_pid_alive;
+
+	ret = kzalloc(sizeof(struct taskmonitor_sample), GFP_KERNEL);
+	if (IS_ERR(ret))
+		goto err_pid_alive;
+
+	INIT_LIST_HEAD(&ret->list);
+	ret->pid = pid_nr(tmon->pid);
+	ret->utime = task->utime;
+	ret->stime = task->stime;
+	ret->vm_total = task->mm->total_vm;
+	ret->vm_stack = task->mm->stack_vm;
+	ret->vm_data = task->mm->data_vm;
+
+err_pid_alive:
+	put_task_struct(task);
+err_pid_task:
+	return ret;
+}
+
+static void taskmonitor_sample_free(struct taskmonitor_sample *smp)
+{
+	kfree(smp);
+}
+
+static void taskmonitor_samples_add(struct taskmonitor *tmon, struct taskmonitor_sample *smp)
+{
+	tmon->samples_count++;
+	list_add_tail(&smp->list, &tmon->samples);
+}
+
+static void taskmonitor_samples_reset(struct taskmonitor *tmon)
+{
+	struct taskmonitor_sample *smp, *next;
+
+	tmon->samples_count = 0;
+	list_for_each_entry_safe(smp, next, &tmon->samples, list)
+		taskmonitor_sample_free(smp);
+}
 
 static void taskmonitor_unset_pid(struct taskmonitor *tmon)
 {
@@ -36,26 +96,8 @@ static void taskmonitor_unset_pid(struct taskmonitor *tmon)
 
 	put_pid(tmon->pid);
 	tmon->pid = NULL;
-}
 
-static int taskmonitor_sample(struct taskmonitor *tmon, struct taskmonitor_sample *smp)
-{
-	struct task_struct *task = get_pid_task(tmon->pid, PIDTYPE_PID);
-	if (IS_ERR(task))
-		return PTR_ERR(task);
-
-	if (!task || !pid_alive(task))
-		return 0;
-
-	*smp = (struct taskmonitor_sample) {
-		.pid = pid_nr(tmon->pid),
-		.utime = task->utime,
-		.stime = task->stime,
-	};
-
-	put_task_struct(task);
-
-	return 1;
+	taskmonitor_samples_reset(tmon);
 }
 
 static void taskmonitor_lock(struct taskmonitor *tmon)
@@ -71,23 +113,22 @@ static void taskmonitor_unlock(struct taskmonitor *tmon)
 // alias monitor_fn
 static int taskmonitor_threadfn(void *arg)
 {
-	int err;
 	struct taskmonitor *tmon = arg;
-	struct taskmonitor_sample smp;
+	struct taskmonitor_sample *smp;
 
 	while (!kthread_should_stop()) {
 		taskmonitor_lock(tmon);
 
-		err = taskmonitor_sample(tmon, &smp);
-		if (err <= 0) {
+		smp = taskmonitor_sample_new(tmon);
+		if (IS_ERR(smp)) {
 			taskmonitor_unset_pid(tmon);
 			taskmonitor_unlock(tmon);
-			return err;
+			return PTR_ERR(smp);
 		}
 
-		taskmonitor_unlock(tmon);
+		taskmonitor_samples_add(tmon, smp);
 
-		printk(KERN_INFO "pid %d usr %llu sys %llu\n", smp.pid, smp.utime, smp.stime);
+		taskmonitor_unlock(tmon);
 
 		schedule_timeout_uninterruptible(HZ);
 	}
@@ -161,14 +202,14 @@ static int taskmonitor_set_pid(struct taskmonitor *tmon, pid_t nr)
 {
 	struct pid *pid;
 
-	taskmonitor_unset_pid(tmon);
-
 	pid = find_get_pid(nr);
 	if (IS_ERR(pid))
 		return PTR_ERR(pid);
 
 	if (!pid)
 		return -EINVAL;
+
+	taskmonitor_unset_pid(tmon);
 
 	tmon->pid = pid;
 
@@ -177,66 +218,77 @@ static int taskmonitor_set_pid(struct taskmonitor *tmon, pid_t nr)
 	return 0;
 }
 
-// global private taskmonitor instance
+static struct taskmonitor *taskmonitor_new(void)
+{
+	struct taskmonitor *tmon;
+
+	tmon = kzalloc(sizeof(struct taskmonitor), GFP_KERNEL);
+	if (IS_ERR(tmon))
+		return tmon;
+
+	mutex_init(&tmon->lock);
+	mutex_init(&tmon->thread_lock);
+	INIT_LIST_HEAD(&tmon->samples);
+
+	return tmon;
+}
+
+static void taskmonitor_free(struct taskmonitor *tmon)
+{
+	taskmonitor_stop_unlocked(tmon);
+	taskmonitor_unset_pid(tmon);
+	mutex_destroy(&tmon->lock);
+	mutex_destroy(&tmon->thread_lock);
+	kfree(tmon);
+}
+
+
 static struct taskmonitor *taskmonitor_private;
 
 static long taskmonitor_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	int err;
+	int ret;
 	pid_t pid;
 	void __user *ptr = (void __user *)arg;
 	struct taskmonitor *tmon = taskmonitor_private;
-	struct taskmonitor_sample smp;
+	struct taskmonitor_sample *smp;
 
 	switch (cmd) {
 	case TM_GET:
-		err = taskmonitor_sample(tmon, &smp);
-		if (err <= 0)
-			return err ? err : -EINVAL;
+		smp = taskmonitor_sample_new(tmon);
+		if (IS_ERR_OR_NULL(smp))
+			return smp ? PTR_ERR(smp) : -EINVAL;
 
 		struct task_sample usmp = {
-			.utime = smp.utime,
-			.stime = smp.stime,
+			.utime = smp->utime,
+			.stime = smp->stime,
 		};
 
-		err = copy_to_user(ptr, &usmp, sizeof(usmp));
-		if (err)
-			return err;
-
-		return 0;
+		ret = copy_to_user(ptr, &usmp, sizeof(usmp));
+		taskmonitor_sample_free(smp);
+		return ret;
 
 	case TM_START:
-		err = taskmonitor_start(tmon);
-		if (err)
-			return err;
-
-		return 0;
+		return taskmonitor_start(tmon);
 
 	case TM_STOP:
 		taskmonitor_stop(tmon);
-
 		return 0;
 
 	case TM_PID:
-		err = copy_from_user(&pid, ptr, sizeof(pid));
-		if (err)
-			return err;
+		ret = copy_from_user(&pid, ptr, sizeof(pid));
+		if (ret)
+			return ret;
 
 		if (pid < 0) {
 			if (!tmon->pid)
 				return -EINVAL;
 
 			pid = pid_nr(tmon->pid);
-			err = copy_to_user(ptr, &pid, sizeof(pid));
-			if (err)
-				return err;
+			return copy_to_user(ptr, &pid, sizeof(pid));
 		} else {
-			err = taskmonitor_set_pid(tmon, pid);
-			if (err)
-				return err;
+			return taskmonitor_set_pid(tmon, pid);
 		}
-
-		return 0;
 
 	default:
 		return -ENOTTY;
@@ -272,22 +324,32 @@ static ssize_t taskmonitor_store(struct kobject *kobj, struct kobj_attribute *at
 
 static ssize_t taskmonitor_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-	int err;
+	int ret, size, count = 0;
 	struct taskmonitor *tmon = taskmonitor_private;
-	struct taskmonitor_sample smp;
+	struct taskmonitor_sample *smp;
 
 	taskmonitor_lock(tmon);
 
-	err = taskmonitor_sample(tmon, &smp);
-	if (err <= 0) {
-		taskmonitor_unset_pid(tmon);
-		taskmonitor_unlock(tmon);
-		return err;
+	list_for_each_entry_reverse(smp, &tmon->samples, list) {
+		size = PAGE_SIZE - count;
+		ret = snprintf(buf, size,
+			       "pid %d usr %llu sys %llu vm_total %lu vm_stack %lu vm_data %lu\n",
+			       smp->pid, smp->utime, smp->stime, smp->vm_total, smp->vm_stack,
+			       smp->vm_data);
+		if (ret >= size)
+			break;
+
+		memmove(buf + size - ret, buf, ret);
+
+		count += ret;
 	}
 
 	taskmonitor_unlock(tmon);
 
-	return sysfs_emit(buf, "pid %d usr %llu sys %llu\n", smp.pid, smp.utime, smp.stime);
+	memmove(buf, buf + PAGE_SIZE - count, count);
+	buf[count] = '\0';
+
+	return count;
 }
 
 static const struct kobj_attribute taskmonitor_attr = __ATTR_RW(taskmonitor);
@@ -300,13 +362,9 @@ static int __init taskmonitor_init(void)
 	int err;
 	struct taskmonitor *tmon;
 
-	tmon = kzalloc(sizeof(struct taskmonitor), GFP_KERNEL);
-	if (IS_ERR(tmon)) {
-		err = PTR_ERR(tmon);
-		goto err_kzalloc;
-	}
-
-	mutex_init(&tmon->lock);
+	tmon = taskmonitor_new();
+	if (IS_ERR(tmon))
+		return PTR_ERR(tmon);
 
 	taskmonitor_private = tmon;
 
@@ -335,11 +393,7 @@ static int __init taskmonitor_init(void)
 err_chrdev:
 	sysfs_remove_file(kernel_kobj, &taskmonitor_attr.attr);
 err_monitor:
-	taskmonitor_stop_unlocked(tmon);
-	taskmonitor_unset_pid(tmon);
-	mutex_destroy(&tmon->lock);
-	kfree(tmon);
-err_kzalloc:
+	taskmonitor_free(tmon);
 	return err;
 }
 module_init(taskmonitor_init)
@@ -350,10 +404,7 @@ static void __exit taskmonitor_exit(void)
 
 	unregister_chrdev(taskmonitor_major, "taskmonitor");
 	sysfs_remove_file(kernel_kobj, &taskmonitor_attr.attr);
-	taskmonitor_stop_unlocked(tmon);
-	taskmonitor_unset_pid(tmon);
-	mutex_destroy(&tmon->lock);
-	kfree(tmon);
+	taskmonitor_free(tmon);
 }
 module_exit(taskmonitor_exit)
 
