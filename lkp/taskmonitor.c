@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0
 
-#include "linux/gfp_types.h"
-#include "linux/list.h"
-#include "linux/shrinker.h"
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/err.h>
 #include <linux/fs.h>
+#include <linux/gfp_types.h>
 #include <linux/kernel.h>
 #include <linux/kobject.h>
 #include <linux/kthread.h>
+#include <linux/list.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pid.h>
 #include <linux/sched.h>
+#include <linux/shrinker.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 
@@ -25,6 +25,7 @@ struct taskmonitor {
 	struct list_head samples;
 	unsigned long samples_count;
 	struct shrinker samples_shrinker;
+	struct kmem_cache *samples_cache;
 
 	struct mutex thread_lock;
 	struct task_struct *thread;
@@ -55,7 +56,7 @@ static struct taskmonitor_sample *taskmonitor_sample_new(struct taskmonitor *tmo
 	if (!pid_alive(task))
 		goto err_pid_alive;
 
-	ret = kzalloc(sizeof(struct taskmonitor_sample), GFP_KERNEL);
+	ret = kmem_cache_alloc(tmon->samples_cache, GFP_KERNEL);
 	if (IS_ERR(ret))
 		goto err_pid_alive;
 
@@ -72,9 +73,9 @@ err_pid_task:
 	return ret;
 }
 
-static void taskmonitor_sample_free(struct taskmonitor_sample *smp)
+static void taskmonitor_sample_free(struct taskmonitor *tmon, struct taskmonitor_sample *smp)
 {
-	kfree(smp);
+	kmem_cache_free(tmon->samples_cache, smp);
 }
 
 static void taskmonitor_samples_add(struct taskmonitor *tmon, struct taskmonitor_sample *smp)
@@ -90,7 +91,7 @@ static void taskmonitor_samples_reset(struct taskmonitor *tmon)
 	tmon->samples_count = 0;
 	list_for_each_entry_safe(smp, next, &tmon->samples, list) {
 		list_del(&smp->list);
-		taskmonitor_sample_free(smp);
+		taskmonitor_sample_free(tmon, smp);
 	}
 }
 
@@ -153,7 +154,7 @@ static int taskmonitor_start_unlocked(struct taskmonitor *tmon)
 	if (tmon->thread)
 		return 0;
 
-	thread = kthread_create(taskmonitor_threadfn, tmon, "taskmonitor/pid:%d", pid_nr(tmon->pid));
+	thread = kthread_create(taskmonitor_threadfn, tmon, "tmon/%d", pid_nr(tmon->pid));
 	if (IS_ERR(thread))
 		return PTR_ERR(thread);
 
@@ -257,7 +258,7 @@ static unsigned long taskmonitor_samples_scan_objects(struct shrinker *sh,
 			break;
 
 		list_del(&smp->list);
-		taskmonitor_sample_free(smp);
+		taskmonitor_sample_free(tmon, smp);
 
 		tmon->samples_count--;
 		sc->nr_scanned++;
@@ -279,7 +280,9 @@ static struct taskmonitor *taskmonitor_new(void)
 
 	mutex_init(&tmon->lock);
 	mutex_init(&tmon->thread_lock);
+
 	INIT_LIST_HEAD(&tmon->samples);
+
 	tmon->samples_shrinker.count_objects = taskmonitor_samples_count_objects;
 	tmon->samples_shrinker.scan_objects = taskmonitor_samples_scan_objects;
 	tmon->samples_shrinker.batch = 0;
@@ -288,8 +291,19 @@ static struct taskmonitor *taskmonitor_new(void)
 	if (err)
 		goto err_shrinker;
 
+	tmon->samples_cache = kmem_cache_create("task_sample",
+						sizeof(struct taskmonitor_sample),
+						__alignof__(struct taskmonitor_sample),
+						0, NULL);
+	if (!tmon->samples_cache) {
+		err = -ENOMEM;
+		goto err_cache;
+	}
+
 	return tmon;
 
+err_cache:
+	unregister_shrinker(&tmon->samples_shrinker);
 err_shrinker:
 	mutex_destroy(&tmon->lock);
 	mutex_destroy(&tmon->thread_lock);
@@ -301,6 +315,7 @@ static void taskmonitor_free(struct taskmonitor *tmon)
 {
 	taskmonitor_stop_unlocked(tmon);
 	taskmonitor_unset_pid(tmon);
+	kmem_cache_destroy(tmon->samples_cache);
 	unregister_shrinker(&tmon->samples_shrinker);
 	mutex_destroy(&tmon->lock);
 	mutex_destroy(&tmon->thread_lock);
