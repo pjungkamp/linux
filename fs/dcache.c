@@ -96,9 +96,11 @@ EXPORT_SYMBOL(dotdot_name);
  * information, yet avoid using a prime hash-size or similar.
  */
 
-static unsigned int d_hash_shift __read_mostly;
+unsigned int d_hash_shift __read_mostly;
+EXPORT_SYMBOL_GPL(d_hash_shift);
 
-static struct hlist_bl_head *dentry_hashtable __read_mostly;
+struct hlist_bl_head *dentry_hashtable __read_mostly;
+EXPORT_SYMBOL_GPL(dentry_hashtable);
 
 static inline struct hlist_bl_head *d_hash(unsigned int hash)
 {

@@ -599,4 +599,7 @@ struct name_snapshot {
 void take_dentry_name_snapshot(struct name_snapshot *, struct dentry *);
 void release_dentry_name_snapshot(struct name_snapshot *);
 
+extern unsigned int d_hash_shift __read_mostly;
+extern struct hlist_bl_head *dentry_hashtable __read_mostly;
+
 #endif	/* __LINUX_DCACHE_H */
