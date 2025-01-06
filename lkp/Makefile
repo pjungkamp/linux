@@ -1,3 +1,3 @@
 # SPDX-License-Identifier: GPL-2.0
 
-obj-m += example.o
+obj-m += example.o weasel.o
